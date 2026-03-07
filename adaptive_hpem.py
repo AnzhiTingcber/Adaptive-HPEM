@@ -4,6 +4,7 @@ import math
 import matplotlib.pyplot as plt
 import heapq
 import struct
+import time
 import psutil
 # 假设这些是你本地的辅助函数库
 from OLH import OLH, OLH_file
@@ -676,7 +677,210 @@ def plot_model_comparison(epsilon_values, all_results):
     return model_avg
 
 
+def _build_candidate_set_adaptive(Ct, prev_estimates, i, k, m, g, adaptive, initial_prune_ratio, final_prune_ratio):
+    """按轮次构造候选集，并返回候选集与当前轮次剪枝比例。"""
+    if adaptive and i > 1 and prev_estimates:
+        sorted_items = sorted(prev_estimates.items(), key=lambda item: item[1], reverse=True)
+        num_candidates = len(sorted_items)
+
+        if g > 2:
+            prune_ratio = initial_prune_ratio - (initial_prune_ratio - final_prune_ratio) * (i - 2) / (g - 2)
+        else:
+            prune_ratio = initial_prune_ratio
+        prune_ratio = max(final_prune_ratio, min(initial_prune_ratio, prune_ratio))
+
+        num_to_keep = max(k, int(num_candidates * prune_ratio))
+        candidates_to_expand = [item[0] for item in sorted_items[:num_to_keep]]
+
+        D = []
+        sr_curr = math.ceil(math.log2(k)) + math.ceil(i * (m - math.ceil(math.log2(k))) / g)
+        sr_prev = math.ceil(math.log2(k)) + math.ceil((i - 1) * (m - math.ceil(math.log2(k))) / g)
+        s_len_diff = sr_curr - sr_prev
+
+        for ct_val in candidates_to_expand:
+            prefix = ct_val << s_len_diff
+            for suffix in range(1 << s_len_diff):
+                D.append(prefix | suffix)
+
+        return D, prune_ratio
+
+    return construct_D(Ct, k, m, i, g), 1.0
+
+
+def profile_pe_method(stage_tries, k, m, g, c, epsilon, method='olh', adaptive=False,
+                      initial_prune_ratio=0.8, final_prune_ratio=0.2):
+    """带统计信息执行算法，返回每轮候选规模/内存/耗时及总耗时。"""
+    S0 = math.ceil(math.log2(k))
+    Ct = list(range(0, 1 << S0))
+    prev_estimates = {}
+    round_stats = {
+        'candidate_size': [],
+        'memory_mb': [],
+        'round_runtime_s': [],
+        'prune_ratio': []
+    }
+
+    process = psutil.Process()
+    for i in range(1, g + 1):
+        t_X, Ni = split_prefix_X(stage_tries, i)
+        current_trie = stage_tries[i]
+
+        D, prune_ratio = _build_candidate_set_adaptive(
+            Ct, prev_estimates, i, k, m, g, adaptive, initial_prune_ratio, final_prune_ratio
+        )
+
+        round_stats['candidate_size'].append(len(D))
+        round_stats['prune_ratio'].append(prune_ratio)
+        round_stats['memory_mb'].append(process.memory_info().rss / (1024 ** 2))
+
+        estimated_memory = len(D) * 8 / (1024 ** 2)
+        use_file = estimated_memory > get_available_memory() * 0.3
+
+        round_t0 = time.perf_counter()
+
+        if use_file:
+            construct_D_file(Ct, k, m, i, g)
+            if method == 'olh':
+                OLH_file(t_X, Ni, c, epsilon, i)
+            else:
+                set_wheel_file(t_X, Ni, c, epsilon, i)
+            Ct, dist = construct_C_file(k, i)
+        else:
+            class TrieDataAdapter:
+                def __init__(self, trie):
+                    self.trie = trie
+
+                def get_element_counts(self):
+                    return self.trie.get_all_elements()
+
+            if method == 'olh':
+                est = OLH(TrieDataAdapter(current_trie), Ni, c, epsilon, D)
+            else:
+                est = set_wheel(TrieDataAdapter(current_trie), Ni, c, epsilon, D)
+            Ct, dist = construct_C(est, k, D)
+
+        round_t1 = time.perf_counter()
+        round_stats['round_runtime_s'].append(max(0.0, round_t1 - round_t0))
+
+        if Ct and dist:
+            prev_estimates = dict(zip(Ct, dist))
+
+    round_stats['total_runtime_s'] = sum(round_stats['round_runtime_s'])
+    return Ct, dist, round_stats
+
+
+def plot_runtime_vs_n(dataset_name, runtime_results, output_path):
+    """绘制 Runtime vs N 曲线图。"""
+    plt.figure(figsize=(8, 5))
+    for model_name, points in runtime_results.items():
+        x_vals = [x for x, _ in points]
+        y_vals = [y for _, y in points]
+        plt.plot(x_vals, y_vals, marker='o', linewidth=2, label=model_name)
+
+    plt.xlabel('N (number of users)')
+    plt.ylabel('Runtime (seconds)')
+    plt.title(f'Runtime vs N ({dataset_name})')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
+def plot_round_curve(dataset_name, round_results, metric_key, ylabel, title, output_path, log_scale=False):
+    """绘制按轮次变化曲线（Memory / Candidate Size）。"""
+    plt.figure(figsize=(8, 5))
+    for model_name, stat in round_results.items():
+        rounds = list(range(1, len(stat[metric_key]) + 1))
+        plt.plot(rounds, stat[metric_key], marker='o', linewidth=2, label=model_name)
+
+    if log_scale:
+        plt.yscale('log')
+
+    plt.xlabel('Round g')
+    plt.ylabel(ylabel)
+    plt.title(f'{title} ({dataset_name})')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
+def run_efficiency_analysis(dataset_name, file_name, m, k, g, c, epsilon,
+                            n_values, initial_prune_ratio, final_prune_ratio,
+                            output_dir='../../result/efficiency'):
+    """输出三类效率验证曲线：Runtime vs N / Memory vs Round / Candidate Size vs Round。"""
+    import os
+    import time
+
+    if not os.path.exists(file_name):
+        print(f"[Skip] 数据集不存在，跳过效率分析: {file_name}")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    X, _, _, N_full, c_data = read_data(file_name, k)
+    c_eff = c if c is not None else c_data
+
+    runtime_results = {
+        'PEM_OLH': [],
+        'PEM_Wheel': [],
+        'A-HPEM': []
+    }
+
+    for n_target in n_values:
+        n_eff = min(n_target, N_full)
+        X_sub = X[:n_eff]
+        stage_tries, si_trie = data_to_prefix_t(X_sub, n_eff, g, c_eff, m, k)
+
+        t0 = time.perf_counter()
+        profile_pe_method(stage_tries, k, m, g, c_eff, epsilon, method='olh', adaptive=False)
+        runtime_results['PEM_OLH'].append((n_eff, time.perf_counter() - t0))
+
+        t0 = time.perf_counter()
+        profile_pe_method(stage_tries, k, m, g, c_eff, epsilon, method='wheel', adaptive=False)
+        runtime_results['PEM_Wheel'].append((n_eff, time.perf_counter() - t0))
+
+        t0 = time.perf_counter()
+        profile_pe_method(stage_tries, k, m, g, c_eff, epsilon, method='wheel', adaptive=True,
+                          initial_prune_ratio=initial_prune_ratio, final_prune_ratio=final_prune_ratio)
+        runtime_results['A-HPEM'].append((n_eff, time.perf_counter() - t0))
+
+        print(f"[{dataset_name}] Runtime benchmark done: N={n_eff}")
+
+    largest_n = min(max(n_values), N_full)
+    X_sub = X[:largest_n]
+    stage_tries, si_trie = data_to_prefix_t(X_sub, largest_n, g, c_eff, m, k)
+
+    _, _, olh_round = profile_pe_method(stage_tries, k, m, g, c_eff, epsilon, method='olh', adaptive=False)
+    _, _, wheel_round = profile_pe_method(stage_tries, k, m, g, c_eff, epsilon, method='wheel', adaptive=False)
+    _, _, ahpem_round = profile_pe_method(stage_tries, k, m, g, c_eff, epsilon, method='wheel', adaptive=True,
+                                          initial_prune_ratio=initial_prune_ratio,
+                                          final_prune_ratio=final_prune_ratio)
+
+    round_results = {
+        'PEM_OLH': olh_round,
+        'PEM_Wheel': wheel_round,
+        'A-HPEM': ahpem_round,
+    }
+
+    runtime_path = os.path.join(output_dir, f'{dataset_name}_runtime_vs_n.png')
+    memory_path = os.path.join(output_dir, f'{dataset_name}_memory_vs_round.png')
+    candidate_path = os.path.join(output_dir, f'{dataset_name}_candidate_vs_round.png')
+
+    plot_runtime_vs_n(dataset_name, runtime_results, runtime_path)
+    plot_round_curve(dataset_name, round_results, 'memory_mb', 'Memory (MB)', 'Memory vs Round', memory_path)
+    plot_round_curve(dataset_name, round_results, 'candidate_size', 'Candidate size', 'Candidate Size vs Round',
+                     candidate_path, log_scale=True)
+
+    print(f"[Done] 效率曲线已保存: {runtime_path}")
+    print(f"[Done] 效率曲线已保存: {memory_path}")
+    print(f"[Done] 效率曲线已保存: {candidate_path}")
+
+
 if __name__ == '__main__':
+    import os
+
     # 配置参数
     m = 64
     k = 16
@@ -689,7 +893,6 @@ if __name__ == '__main__':
 
     # 读取数据
     X, Real_k_dist, Real_k_data, N, c = read_data(file_name, k)
-
     c = 10
 
     print("=== 真实数据信息 ===")
@@ -717,6 +920,7 @@ if __name__ == '__main__':
     # 初始化所有结果文件
     for model in model_files.values():
         for f in model.values():
+            os.makedirs(os.path.dirname(f), exist_ok=True)
             with open(f, 'w') as file:
                 file.write('')
 
@@ -810,3 +1014,26 @@ if __name__ == '__main__':
     print("\n3. MSE平均值（科学计数法）:")
     for model in all_results:
         print(f"{model:18} {[f'{s:.2e}' for s in model_avg['mse'][model]]}")
+
+    # 新增：效率验证曲线（Runtime/Memory/Candidate）
+    efficiency_datasets = {
+        'synthetic': '../../data/synthetic_data/64_15.txt',
+        'url': '../../data/url_data/url.txt',
+    }
+    n_values = [10 ** 4, 5 * 10 ** 4, 10 ** 5, 5 * 10 ** 5, 10 ** 6]
+    efficiency_epsilon = 1.0
+
+    for dataset_name, dataset_path in efficiency_datasets.items():
+        run_efficiency_analysis(
+            dataset_name=dataset_name,
+            file_name=dataset_path,
+            m=m,
+            k=k,
+            g=g,
+            c=c,
+            epsilon=efficiency_epsilon,
+            n_values=n_values,
+            initial_prune_ratio=initial_prune_ratio,
+            final_prune_ratio=final_prune_ratio,
+            output_dir='../../result/efficiency'
+        )
