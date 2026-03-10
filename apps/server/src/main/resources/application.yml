@@ -1,0 +1,18 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: chat-server
+  datasource:
+    url: jdbc:postgresql://localhost:5432/chat_app
+    username: postgres
+    password: postgres
+  jpa:
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+  data:
+    redis:
+      host: localhost
+      port: 6379
